@@ -66,8 +66,9 @@ class PortrayalPlugin(Star):
         try:
             group_openid, user_id = self._extract_qqofficial_ids(event)
             if group_openid and user_id and event.message_str:
+                nickname = event.get_sender_name() or ""
                 self.msg.collect_qqofficial_message(
-                    group_openid, user_id, event.message_str
+                    group_openid, user_id, event.message_str, nickname
                 )
         except Exception as e:
             logger.debug(f"[portrayal_qq] 消息缓存失败: {e}")
@@ -111,30 +112,21 @@ class PortrayalPlugin(Star):
         return None
 
     def _extract_nickname_from_qqofficial(self, event: AstrMessageEvent, target_id: str) -> str:
-        """从QQ官方Bot消息中提取目标用户昵称。"""
-        # 方式1: At组件的name属性(AstrBot可能已从mentions解析)
+        """获取目标用户昵称。优先从消息缓存中的昵称映射取。"""
+        # 方式1: 从消息缓存中查昵称(拦截消息时已缓存)
+        cached_nick = self.msg.get_nickname(target_id)
+        if cached_nick:
+            return cached_nick
+
+        # 方式2: At组件name属性
         from astrbot.core.message.components import At
         message_obj = getattr(event, "message_obj", None)
         if message_obj and hasattr(message_obj, "message"):
             for comp in message_obj.message:
                 if isinstance(comp, At) and str(comp.qq) == target_id:
-                    name = getattr(comp, "name", "") or getattr(comp, "qq", "")
+                    name = getattr(comp, "name", "") or ""
                     if name and name != target_id:
                         return str(name)
-
-        # 方式2: raw_data.mentions[].username
-        raw_msg = getattr(getattr(event, "message_obj", None), "raw_message", None)
-        raw = getattr(raw_msg, "raw_data", None)
-        if isinstance(raw, dict):
-            mentions = raw.get("mentions") or []
-            if isinstance(mentions, list):
-                for m in mentions:
-                    if isinstance(m, dict):
-                        mid = str(m.get("member_openid", "") or m.get("id", "") or "")
-                        if mid == target_id:
-                            nick = str(m.get("username", "") or "").strip()
-                            if nick:
-                                return nick
 
         # 方式3: 发送者昵称(如果target就是sender)
         if target_id == event.get_sender_id():

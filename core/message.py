@@ -37,6 +37,7 @@ class MessageManager:
         self.cfg = config.message
         self._storage = MessageCacheStorage(config.cache_dir)
         self._user_cache, self._group_cursor = self._storage.load()
+        self._nickname_cache: dict[str, str] = {}
         self._group_locks: dict[str, asyncio.Lock] = {}
 
     # =========================
@@ -73,9 +74,9 @@ class MessageManager:
     # =========================
 
     def collect_qqofficial_message(
-        self, group_openid: str, user_id: str, text: str
+        self, group_openid: str, user_id: str, text: str, nickname: str = ""
     ) -> None:
-        """QQ官方Bot: 将实时消息存入缓存。由消息拦截器调用。"""
+        """QQ官方Bot: 将实时消息存入缓存,同时缓存昵称映射。"""
         if not text or not text.strip():
             return
         group_id = str(group_openid)
@@ -88,6 +89,13 @@ class MessageManager:
         else:
             cached.texts.append(text)
             cached.timestamp = now
+        # 缓存昵称映射
+        if nickname:
+            self._nickname_cache[user_id] = nickname
+
+    def get_nickname(self, user_id: str) -> str | None:
+        """从缓存获取用户昵称。"""
+        return self._nickname_cache.get(str(user_id))
 
     def get_user_texts_qqofficial(
         self, group_openid: str, target_id: str
