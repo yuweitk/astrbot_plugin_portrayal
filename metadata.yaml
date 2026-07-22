@@ -1,0 +1,7 @@
+name: astrbot_plugin_portrayal
+display_name: 人物画像(QQ官方Bot适配)
+desc: 爬取群友聊天记录+LLM分析群友画像。新增QQ官方Bot实时消息拦截+本地缓存支持。
+help: 画像 @群友 / 查看画像 @群友 / 克隆人格 @群友 / 切换人格 @群友 / 恢复人格
+version: v1.2.0-qq
+author: Zhalslar(原作)+yuweitk(QQ官方Bot适配)
+repo: https://github.com/yuweitk/astrbot_plugin_portrayal
