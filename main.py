@@ -181,9 +181,10 @@ class PortrayalPlugin(Star):
         filter.PlatformAdapterType.QQOFFICIAL
         | filter.PlatformAdapterType.QQOFFICIAL_WEBHOOK
     )
-    @filter.command("查看画像")
     async def view_portrayal_qqofficial(self, event: AstrMessageEvent):
         """QQ官方Bot: 查看画像 @群友"""
+        if not event.message_str.startswith("查看画像"):
+            return
         target_id = self._parse_at_from_qqofficial(event)
         if not target_id:
             yield event.plain_result("命令格式：查看画像 @群友")
@@ -202,13 +203,15 @@ class PortrayalPlugin(Star):
     # ================================================================
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("切换人格")
     @filter.platform_adapter_type(
         filter.PlatformAdapterType.QQOFFICIAL
         | filter.PlatformAdapterType.QQOFFICIAL_WEBHOOK
     )
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def switch_persona_qqofficial(self, event: AstrMessageEvent):
         """QQ官方Bot版切换人格: 仅切换对话人格,不修改bot资料"""
+        if not event.message_str.startswith("切换人格"):
+            return
         target_id = self._parse_at_from_qqofficial(event)
         if not target_id:
             yield event.plain_result("命令格式：切换人格 @群友")
