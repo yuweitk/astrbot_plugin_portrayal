@@ -110,6 +110,35 @@ class PortrayalPlugin(Star):
         
         return None
 
+    def _extract_nickname_from_qqofficial(self, event: AstrMessageEvent, target_id: str) -> str:
+        """从QQ官方Bot消息中提取目标用户的昵称。
+
+        mentions[].username = @对象的昵称
+        author.username = 发送者昵称
+        """
+        raw_msg = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        raw = getattr(raw_msg, "raw_data", None)
+        if isinstance(raw, dict):
+            # @对象的昵称在mentions数组
+            mentions = raw.get("mentions") or []
+            if isinstance(mentions, list):
+                for m in mentions:
+                    if isinstance(m, dict):
+                        mid = str(m.get("member_openid", "") or m.get("id", "") or "")
+                        if mid == target_id:
+                            nick = str(m.get("username", "") or "").strip()
+                            if nick:
+                                return nick
+            # 如果target就是发送者
+            author = raw.get("author") or {}
+            if isinstance(author, dict):
+                aid = str(author.get("member_openid", "") or "")
+                if aid == target_id:
+                    nick = str(author.get("username", "") or "").strip()
+                    if nick:
+                        return nick
+        return target_id[:8]
+
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     @filter.platform_adapter_type(
         filter.PlatformAdapterType.QQOFFICIAL
@@ -136,8 +165,9 @@ class PortrayalPlugin(Star):
         end_param = event.message_str.split(" ")[-1]
         query_rounds = self.cfg.message.get_query_rounds(end_param)
 
-        # QQ官方Bot: 使用 member_openid 作为 user_id, nickname 从缓存推断
-        profile = UserProfile(user_id=target_id, nickname=target_id[:8])
+        # QQ官方Bot: 从mentions提取昵称,回退到sender_name
+        nickname = self._extract_nickname_from_qqofficial(event, target_id)
+        profile = UserProfile(user_id=target_id, nickname=nickname)
         if old_profile := self.db.get(target_id):
             profile = old_profile
 
