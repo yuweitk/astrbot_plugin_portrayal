@@ -1,4 +1,5 @@
 import base64
+import re
 import time
 
 import aiohttp
@@ -76,14 +77,37 @@ class PortrayalPlugin(Star):
     # ================================================================
 
     def _parse_at_from_qqofficial(self, event: AstrMessageEvent) -> str | None:
-        """从QQ官方Bot消息中解析@的用户ID。"""
+        """从QQ官方Bot消息中解析@的用户ID。
+        
+        QQ官方Bot的@有两种形式：
+        1. At组件（AstrBot解析后） → comp.qq
+        2. 文本中的 <@OPENID> （QQ原生格式）→ 正则提取
+        3. raw_message.mentions 数组
+        """
         from astrbot.core.message.components import At
 
+        # 方式1: At组件
         message_obj = getattr(event, "message_obj", None)
         if message_obj and hasattr(message_obj, "message"):
             for comp in message_obj.message:
                 if isinstance(comp, At):
                     return str(comp.qq)
+
+        # 方式2: 正则提取 <@OPENID>
+        text = event.message_str
+        m = re.search(r'<@(\w+)>', text)
+        if m:
+            return m.group(1)
+
+        # 方式3: raw_message.mentions
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        if isinstance(raw, dict):
+            mentions = raw.get("mentions", [])
+            if mentions and isinstance(mentions, list) and len(mentions) > 0:
+                first = mentions[0]
+                if isinstance(first, dict):
+                    return str(first.get("member_openid", "") or first.get("id", "") or "")
+        
         return None
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
