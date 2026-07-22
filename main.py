@@ -111,15 +111,21 @@ class PortrayalPlugin(Star):
         return None
 
     def _extract_nickname_from_qqofficial(self, event: AstrMessageEvent, target_id: str) -> str:
-        """从QQ官方Bot消息中提取目标用户的昵称。
+        """从QQ官方Bot消息中提取目标用户昵称。"""
+        # 方式1: At组件的name属性(AstrBot可能已从mentions解析)
+        from astrbot.core.message.components import At
+        message_obj = getattr(event, "message_obj", None)
+        if message_obj and hasattr(message_obj, "message"):
+            for comp in message_obj.message:
+                if isinstance(comp, At) and str(comp.qq) == target_id:
+                    name = getattr(comp, "name", "") or getattr(comp, "qq", "")
+                    if name and name != target_id:
+                        return str(name)
 
-        mentions[].username = @对象的昵称
-        author.username = 发送者昵称
-        """
+        # 方式2: raw_data.mentions[].username
         raw_msg = getattr(getattr(event, "message_obj", None), "raw_message", None)
         raw = getattr(raw_msg, "raw_data", None)
         if isinstance(raw, dict):
-            # @对象的昵称在mentions数组
             mentions = raw.get("mentions") or []
             if isinstance(mentions, list):
                 for m in mentions:
@@ -129,14 +135,13 @@ class PortrayalPlugin(Star):
                             nick = str(m.get("username", "") or "").strip()
                             if nick:
                                 return nick
-            # 如果target就是发送者
-            author = raw.get("author") or {}
-            if isinstance(author, dict):
-                aid = str(author.get("member_openid", "") or "")
-                if aid == target_id:
-                    nick = str(author.get("username", "") or "").strip()
-                    if nick:
-                        return nick
+
+        # 方式3: 发送者昵称(如果target就是sender)
+        if target_id == event.get_sender_id():
+            name = event.get_sender_name()
+            if name and name != target_id:
+                return str(name)
+
         return target_id[:8]
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
