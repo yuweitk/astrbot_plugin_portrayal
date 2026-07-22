@@ -202,7 +202,6 @@ class PortrayalPlugin(Star):
     # 切换/恢复人格: QQ官方Bot不支持bot资料修改, 仅做提示
     # ================================================================
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.platform_adapter_type(
         filter.PlatformAdapterType.QQOFFICIAL
         | filter.PlatformAdapterType.QQOFFICIAL_WEBHOOK
@@ -211,6 +210,9 @@ class PortrayalPlugin(Star):
     async def switch_persona_qqofficial(self, event: AstrMessageEvent):
         """QQ官方Bot版切换人格: 仅切换对话人格,不修改bot资料"""
         if not event.message_str.startswith("切换人格"):
+            return
+        if not event.is_admin():
+            yield event.plain_result("仅管理员可切换人格")
             return
         target_id = self._parse_at_from_qqofficial(event)
         if not target_id:
