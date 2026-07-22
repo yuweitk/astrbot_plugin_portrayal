@@ -29,7 +29,7 @@ class PortrayalPlugin(Star):
         self.context = context
         self.cfg = PluginConfig(config, context)
         self.db = UserProfileDB(self.cfg)
-        self.msg = MessageManager(self.cfg)
+        self.msg = MessageManager(context)
         self.entry_service = EntryService(self.cfg)
         self.llm = LLMService(self.cfg)
 
@@ -37,7 +37,7 @@ class PortrayalPlugin(Star):
         pass
 
     async def terminate(self):
-        self.msg.save_cache()
+        pass
 
     # ================================================================
     # QQ官方Bot: 消息拦截器 —— 实时缓存群聊消息
@@ -62,13 +62,15 @@ class PortrayalPlugin(Star):
         | filter.PlatformAdapterType.QQOFFICIAL_WEBHOOK
     )
     async def intercept_qqofficial_messages(self, event: AstrMessageEvent):
-        """拦截QQ官方机器人群消息并存入本地缓存。"""
+        """拦截QQ官方机器人群消息，存入 AstrBot 历史数据库。"""
         try:
             group_openid, user_id = self._extract_qqofficial_ids(event)
             if group_openid and user_id and event.message_str:
                 nickname = event.get_sender_name() or ""
-                self.msg.collect_qqofficial_message(
-                    group_openid, user_id, event.message_str, nickname
+                platform_id = event.get_platform_id() or "qq_official"
+                self.msg.cache_nickname(user_id, nickname)
+                await self.msg.store_message(
+                    platform_id, group_openid, user_id, nickname, event.message_str
                 )
         except Exception as e:
             logger.debug(f"[portrayal_qq] 消息缓存失败: {e}")
@@ -172,9 +174,12 @@ class PortrayalPlugin(Star):
             f"正在发起{query_rounds}轮查询来获取{profile.nickname}的聊天记录..."
         )
 
-        # QQ官方Bot: 从实时缓存读取消息（无历史拉取API）
+        # QQ官方Bot: 从历史数据库查询消息
         group_openid, _ = self._extract_qqofficial_ids(event)
-        result = self.msg.get_user_texts_qqofficial(group_openid, target_id)
+        platform_id = event.get_platform_id() or "qq_official"
+        result = await self.msg.get_user_texts(
+            platform_id, group_openid, target_id, self.cfg.message.max_msg_count
+        )
         if result.is_empty:
             yield event.plain_result("没有查询到该群友的任何消息（QQ官方Bot依靠实时缓存，积累不够）")
             return

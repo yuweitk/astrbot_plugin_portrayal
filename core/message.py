@@ -1,7 +1,5 @@
-"""群聊消息管理器 —— 支持 aiocqhttp (拉取历史) + QQ官方Bot (实时缓存)。
-
-aiocqhttp 模式: 通过 get_group_msg_history API 拉取历史消息
-QQ官方Bot 模式: 通过 @filter 拦截实时消息并本地缓存
+"""群聊消息管理器 —— 使用 AstrBot 内置 message_history_manager 持久化存储。
+对照 astrobot_plugin_qq_group_daily_analysis 的实现方式。
 """
 
 from __future__ import annotations
@@ -9,12 +7,8 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from time import time
-from typing import Any
 
 from astrbot.api import logger
-
-from .config import PluginConfig
-from .message_cache import CachedMessages, MessageCacheStorage
 
 
 @dataclass
@@ -33,168 +27,137 @@ class MessageQueryResult:
 
 
 class MessageManager:
-    def __init__(self, config: PluginConfig):
-        self.cfg = config.message
-        self._storage = MessageCacheStorage(config.cache_dir)
-        self._user_cache, self._group_cursor = self._storage.load()
+    """使用 AstrBot message_history_manager 存储和查询群消息。"""
+
+    def __init__(self, context):
+        self._context = context
+        self._mgr = context.message_history_manager
         self._nickname_cache: dict[str, str] = {}
         self._group_locks: dict[str, asyncio.Lock] = {}
 
-    # =========================
-    # cache helpers
-    # =========================
+    # ---- 存储 ----
 
-    def _user_key(self, group_id: str, user_id: str) -> str:
-        return f"{group_id}:{user_id}"
-
-    def _get_user_cache(self, group_id: str, user_id: str) -> list[str] | None:
-        key = self._user_key(group_id, user_id)
-        cached = self._user_cache.get(key)
-        if not cached:
-            return None
-        if time() - cached.timestamp > self.cfg.cache_ttl:
-            self._group_cursor.pop(group_id, None)
-            for k in tuple(self._user_cache):
-                if k.startswith(f"{group_id}:"):
-                    del self._user_cache[k]
-            self.save_cache()
-            return None
-        return cached.texts
-
-    def clear_cache(self):
-        self._user_cache.clear()
-        self._group_cursor.clear()
-        self._storage.clear()
-
-    def save_cache(self) -> None:
-        self._storage.save(self._user_cache, self._group_cursor)
-
-    # =========================
-    # QQ官方Bot: 实时消息收集
-    # =========================
-
-    def collect_qqofficial_message(
-        self, group_openid: str, user_id: str, text: str, nickname: str = ""
+    async def store_message(
+        self, platform_id: str, group_id: str, sender_id: str, sender_name: str, text: str
     ) -> None:
-        """QQ官方Bot: 将实时消息存入缓存,同时缓存昵称映射。"""
+        """存储消息到 AstrBot 历史数据库（对照分析插件 message_processing_service.py:101）。"""
         if not text or not text.strip():
             return
-        group_id = str(group_openid)
-        user_id = str(user_id)
-        key = self._user_key(group_id, user_id)
-        now = time()
-        cached = self._user_cache.get(key)
-        if not cached:
-            self._user_cache[key] = CachedMessages(texts=[text], timestamp=now)
-        else:
-            cached.texts.append(text)
-            cached.timestamp = now
-        # 缓存昵称映射
-        if nickname:
-            self._nickname_cache[user_id] = nickname
+        try:
+            await self._mgr.insert(
+                platform_id=platform_id,
+                user_id=group_id,
+                content={"type": "user", "message": text},
+                sender_id=sender_id,
+                sender_name=sender_name,
+            )
+        except Exception as e:
+            logger.debug(f"[portrayal_qq] 存储消息失败: {e}")
+
+    # ---- 昵称缓存 ----
+
+    def cache_nickname(self, user_id: str, nickname: str) -> None:
+        if nickname and nickname != user_id:
+            self._nickname_cache[str(user_id)] = nickname
 
     def get_nickname(self, user_id: str) -> str | None:
-        """从缓存获取用户昵称。"""
         return self._nickname_cache.get(str(user_id))
 
-    def get_user_texts_qqofficial(
-        self, group_openid: str, target_id: str
+    # ---- 查询 ----
+
+    async def get_user_texts(
+        self, platform_id: str, group_id: str, target_id: str, max_count: int,
     ) -> MessageQueryResult:
-        """QQ官方Bot: 从实时缓存中读取用户消息。"""
-        group_id = str(group_openid)
+        """查询目标用户的消息（从 AstrBot 历史数据库）。"""
         target_id = str(target_id)
-        cached = self._get_user_cache(group_id, target_id)
-        if not cached:
-            return MessageQueryResult(texts=[], scanned_messages=0, from_cache=True)
-        texts = list(cached)
-        return MessageQueryResult(
-            texts=texts[: self.cfg.max_msg_count],
-            scanned_messages=len(texts),
-            from_cache=True,
-        )
+        texts: list[str] = []
+        page = 1
 
-    # =========================
-    # aiocqhttp: 历史消息拉取
-    # =========================
-
-    def _collect_messages(self, group_id: str, messages: list[dict[str, Any]]):
-        now = time()
-        for msg in messages:
-            user_id = str(msg["sender"]["user_id"])
-            text = "".join(
-                seg["data"]["text"] for seg in msg["message"] if seg["type"] == "text"
-            ).strip()
-            if not text:
-                continue
-            key = self._user_key(group_id, user_id)
-            cached = self._user_cache.get(key)
-            if not cached:
-                self._user_cache[key] = CachedMessages(texts=[text], timestamp=now)
-            else:
-                cached.texts.append(text)
-                cached.timestamp = now
-
-    async def get_user_texts(self, event, target_id: str, *, max_rounds: int) -> MessageQueryResult:
-        """aiocqhttp: 拉取群聊历史消息。"""
-        from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
-            AiocqhttpMessageEvent,
-        )
-
-        if not isinstance(event, AiocqhttpMessageEvent):
-            raise TypeError("get_user_texts 仅支持 AiocqhttpMessageEvent")
-
-        group_id = str(event.get_group_id())
-        target_id = str(target_id)
-
-        cached = self._get_user_cache(group_id, target_id)
-        if cached and len(cached) >= self.cfg.max_msg_count:
-            return MessageQueryResult(
-                texts=cached[: self.cfg.max_msg_count],
-                scanned_messages=0,
-                from_cache=True,
-            )
-
-        texts = cached[:] if cached else []
-        rounds = 0
-        cache_changed = False
-        group_lock = self._group_locks.setdefault(group_id, asyncio.Lock())
-
-        while rounds < max_rounds and len(texts) < self.cfg.max_msg_count:
+        while len(texts) < max_count and page <= 20:
             try:
-                async with group_lock:
-                    cached = self._get_user_cache(group_id, target_id)
-                    if cached and len(cached) >= self.cfg.max_msg_count:
-                        texts = cached[:]
-                        break
-                    message_seq = self._group_cursor.get(group_id, 0)
-                    result = await event.bot.api.call_action(
-                        "get_group_msg_history",
-                        group_id=group_id,
-                        message_seq=message_seq,
-                        count=self.cfg.per_query_count,
-                        reverseOrder=True,
-                    )
-                    messages = result.get("messages", [])
-                    if messages:
-                        message_seq = messages[0]["message_id"]
-                        self._group_cursor[group_id] = message_seq
-                        self._collect_messages(group_id, messages)
-                        cache_changed = True
-                    if not messages:
-                        break
-                    cached = self._get_user_cache(group_id, target_id)
-                    if cached:
-                        texts = cached[:]
+                records = await self._mgr.get(
+                    platform_id=platform_id,
+                    user_id=group_id,
+                    page=page,
+                    page_size=200,
+                )
             except Exception as e:
-                logger.error(e)
+                logger.warning(f"[portrayal_qq] 查询历史失败: {e}")
                 break
-            rounds += 1
 
-        if cache_changed:
-            self.save_cache()
+            if not records:
+                break
 
-        return MessageQueryResult(
-            texts=texts[: self.cfg.max_msg_count],
-            scanned_messages=rounds * self.cfg.per_query_count,
-            from_cache=cached is not None,
-        )
+            for rec in records:
+                sid = str(getattr(rec, "sender_id", "") or "")
+                if sid == target_id:
+                    content = getattr(rec, "content", None)
+                    if isinstance(content, dict) and content.get("message"):
+                        msg = content["message"]
+                        if isinstance(msg, str):
+                            texts.append(msg)
+                        elif isinstance(msg, list):
+                            texts.append(" ".join(str(x) for x in msg))
+                    # 更新昵称缓存
+                    sname = getattr(rec, "sender_name", None) or ""
+                    if sname:
+                        self.cache_nickname(target_id, str(sname))
+
+                sn = getattr(rec, "sender_name", None) or ""
+                if sn:
+                    self.cache_nickname(str(getattr(rec, "sender_id", "") or ""), str(sn))
+
+                if len(texts) >= max_count:
+                    break
+
+            page += 1
+
+        texts = texts[:max_count]
+        return MessageQueryResult(texts=texts, scanned_messages=len(texts), from_cache=False)
+
+    # ---- 统计 ----
+
+    async def estimate_user_count(self, platform_id: str, group_id: str) -> int:
+        """估算群内活跃用户数（用户画像消息积累参考）。"""
+        try:
+            records = await self._mgr.get(
+                platform_id=platform_id,
+                user_id=group_id,
+                page=1,
+                page_size=200,
+            )
+            users = set()
+            for rec in records:
+                sid = str(getattr(rec, "sender_id", "") or "")
+                if sid:
+                    users.add(sid)
+                sn = getattr(rec, "sender_name", None) or ""
+                if sn and sid:
+                    self.cache_nickname(sid, str(sn))
+            return len(users)
+        except Exception:
+            return 0
+
+    # ---- 清理 ----
+
+    async def cleanup_old_messages(self, platform_id: str, group_id: str, days: int = 90) -> None:
+        """清理过期消息。"""
+        try:
+            await self._mgr.delete(
+                platform_id=platform_id,
+                user_id=group_id,
+                offset_sec=days * 86400,
+            )
+        except Exception as e:
+            logger.debug(f"[portrayal_qq] 清理旧消息失败: {e}")
+
+    # ---- 为兼容旧接口保留 ----
+
+    def collect_qqofficial_message(self, group_openid: str, user_id: str, text: str, nickname: str = "") -> None:
+        """兼容旧接口：不再是实时缓存，仅缓存昵称映射。"""
+        if nickname:
+            self.cache_nickname(user_id, nickname)
+
+    def get_user_texts_qqofficial(self, group_openid: str, target_id: str):
+        """兼容旧接口：空结果（应改用 get_user_texts）。"""
+        return MessageQueryResult(texts=[], scanned_messages=0, from_cache=True)
