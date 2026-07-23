@@ -117,6 +117,7 @@ class PortrayalPlugin(Star):
         """获取目标用户昵称。优先从消息缓存中的昵称映射取。"""
         # 方式1: 从消息缓存中查昵称(拦截消息时已缓存)
         cached_nick = self.msg.get_nickname(target_id)
+        logger.info(f"[portrayal_debug] way1 cached_nick={cached_nick}")
         if cached_nick:
             return cached_nick
 
@@ -127,14 +128,42 @@ class PortrayalPlugin(Star):
             for comp in message_obj.message:
                 if isinstance(comp, At) and str(comp.qq) == target_id:
                     name = getattr(comp, "name", "") or ""
+                    logger.info(f"[portrayal_debug] way2 At.name={name}, target_id={target_id}")
                     if name and name != target_id:
                         return str(name)
 
         # 方式3: 发送者昵称(如果target就是sender)
-        if target_id == event.get_sender_id():
-            name = event.get_sender_name()
-            if name and name != target_id:
-                return str(name)
+        sender_id = event.get_sender_id()
+        sender_name = event.get_sender_name()
+        logger.info(f"[portrayal_debug] way3 sender_id={sender_id}, sender_name={sender_name}, target_id={target_id}")
+        if target_id == sender_id:
+            if sender_name and sender_name != target_id:
+                return str(sender_name)
+
+        # 方式4: 从 raw_message 中提取昵称（可能是 dict 或 PatchedGroupMessage 对象）
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        if raw is not None:
+            # PatchedGroupMessage 对象 → 用属性访问
+            if hasattr(raw, "mentions"):
+                mentions = getattr(raw, "mentions", None) or []
+                for m in mentions:
+                    mid = str(getattr(m, "member_openid", "") or getattr(m, "id", "") or "")
+                    if mid == target_id:
+                        username = str(getattr(m, "username", "") or "")
+                        if username:
+                            logger.info(f"[portrayal_debug] way4 obj matched! username={username}")
+                            return username
+            # dict 格式 → 用 key 访问（兜底）
+            elif isinstance(raw, dict):
+                mentions = raw.get("mentions", [])
+                for m in mentions:
+                    if isinstance(m, dict):
+                        mid = str(m.get("member_openid", "") or m.get("id", "") or "")
+                        if mid == target_id:
+                            username = str(m.get("username", "") or "")
+                            if username:
+                                logger.info(f"[portrayal_debug] way4 dict matched! username={username}")
+                                return username
 
         return target_id[:8]
 
@@ -146,6 +175,7 @@ class PortrayalPlugin(Star):
     async def get_portrayal_qqofficial(self, event: AstrMessageEvent):
         """QQ官方Bot: 画像 @群友 <查询轮数>"""
         cmd = event.message_str.partition(" ")[0]
+        logger.info(f"[portrayal_debug] ENTER get_portrayal_qqofficial, cmd={cmd}, platform={event.get_platform_id()}")
         prompt = self.entry_service.get_entry(cmd)
         if not prompt:
             return
@@ -153,6 +183,7 @@ class PortrayalPlugin(Star):
             return
 
         target_id = self._parse_at_from_qqofficial(event)
+        logger.info(f"[portrayal_debug] target_id={target_id}")
         if not target_id:
             yield event.plain_result("命令格式：画像 @群友 <查询轮数>")
             return
@@ -169,6 +200,9 @@ class PortrayalPlugin(Star):
         profile = UserProfile(user_id=target_id, nickname=nickname)
         if old_profile := self.db.get(target_id):
             profile = old_profile
+            # 如果旧记录里昵称还是 openid 截断，用新获取的真实昵称覆盖
+            if nickname and len(nickname) > 1 and len(nickname) < len(target_id):
+                profile.nickname = nickname
 
         yield event.plain_result(
             f"正在发起{query_rounds}轮查询来获取{profile.nickname}的聊天记录..."
