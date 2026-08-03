@@ -8,7 +8,7 @@ from astrbot.api import logger, sp
 from astrbot.api.event import filter
 from astrbot.api.star import Context, Star
 from astrbot.core.config.astrbot_config import AstrBotConfig
-from astrbot.core.message.components import At
+from astrbot.core.message.components import At, Plain, Image, Record, Video
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
@@ -29,7 +29,7 @@ class PortrayalPlugin(Star):
         self.context = context
         self.cfg = PluginConfig(config, context)
         self.db = UserProfileDB(self.cfg)
-        self.msg = MessageManager(context)
+        self.msg = MessageManager(context, data_dir=self.cfg.data_dir)
         self.entry_service = EntryService(self.cfg)
         self.llm = LLMService(self.cfg)
 
@@ -76,6 +76,61 @@ class PortrayalPlugin(Star):
             logger.debug(f"[portrayal_qq] 消息缓存失败: {e}")
 
     # ================================================================
+    # 机器人自己的消息: 事件钩子记录（三重数据源·源1）
+    # ================================================================
+
+    @filter.after_message_sent()
+    async def record_bot_message_after_sent(self, event: AstrMessageEvent):
+        """在机器人发送消息后，把内容写入插件自己的 bot_messages.db。
+
+        为什么需要：QQ官方Bot 的 webhook 不回推机器人自己发的消息，
+        platform_message_history 里永远不会有机器人自己的记录。只有在本体
+        的 OnAfterMessageSentEvent 钩子里主动存档，才能保证从今往后
+        机器人每句话都不丢失（不被 conversations 截断机制裁剪）。
+        """
+        try:
+            # 仅记录 QQ官方Bot 的群消息
+            # 注意：get_platform_id() 返回实例 id（如 "default"），适配器类型要用 platform_meta.name
+            platform_id = event.get_platform_id() or ""
+            platform_meta = getattr(event, "platform_meta", None)
+            adapter_name = (
+                platform_meta.name if platform_meta and getattr(platform_meta, "name", None) else ""
+            )
+            if adapter_name not in ("qq_official", "qq_official_webhook"):
+                return
+            from astrbot.core.platform.message_type import MessageType
+
+            if event.get_message_type() != MessageType.GROUP_MESSAGE:
+                return
+
+            # 从 unified_msg_origin 解析群 openid，格式: platform:GroupMessage:<group_openid>
+            umo = event.unified_msg_origin or ""
+            if ":GroupMessage:" not in umo:
+                return
+            group_openid = umo.split(":GroupMessage:", 1)[1].strip()
+            if not group_openid:
+                return
+
+            # 提取发送的消息链中的纯文本
+            result = event.get_result()
+            if not result:
+                return
+            chain = getattr(result, "chain", None) or []
+            parts = []
+            for comp in chain:
+                if isinstance(comp, Plain):
+                    t = getattr(comp, "text", "") or ""
+                    if t.strip():
+                        parts.append(str(t).strip())
+            text = "\n".join(parts).strip()
+            if not text:
+                return
+
+            await self.msg.bot_store.store(platform_id, group_openid, text)
+        except Exception as e:
+            logger.debug(f"[portrayal_qq] 记录机器人消息失败: {e}")
+
+    # ================================================================
     # QQ官方Bot: 画像命令
     # ================================================================
 
@@ -112,6 +167,69 @@ class PortrayalPlugin(Star):
                     return str(first.get("member_openid", "") or first.get("id", "") or "")
         
         return None
+
+    def _is_at_before_cmd(self, event: AstrMessageEvent, cmd: str) -> bool:
+        """判断消息中 @ 是否出现在命令词之前。
+
+        两种消息形态：
+        - 「画像 @xxx」：命令词在前 → 返回 False
+        - 「@xxx 画像」：@ 在前 → 返回 True
+
+        注意：QQ官方Bot适配器会把 @机器人自己 的 <@openid> 从 message_str
+        中剥离，因此必须优先用 raw_message.content 原始文本判断（其中保留
+        了 <@openid> 的原始位置）；AIOCQHTTP 的 raw_message 没有 content
+        字段，此时回退到消息组件顺序判断。
+        """
+        # 优先：raw_message.content 原始文本（QQ官方Bot保留 <@openid> 位置）
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        content = ""
+        if isinstance(raw, dict):
+            content = raw.get("content", "") or ""
+        elif hasattr(raw, "content"):
+            content = getattr(raw, "content", "") or ""
+        if content:
+            m = re.search(r"<@!?(\w+)>", content)
+            if m:
+                cmd_pos = content.find(cmd)
+                if cmd_pos == -1:
+                    return True
+                return m.start() < cmd_pos
+
+        # 回退：AIOCQHTTP / 其他平台：用消息组件顺序判断
+        try:
+            msgs = event.get_messages()
+            at_idx = None
+            plain_idx = None
+            for i, seg in enumerate(msgs):
+                if isinstance(seg, At) and at_idx is None:
+                    at_idx = i
+                elif isinstance(seg, Plain) and plain_idx is None:
+                    if cmd in getattr(seg, "text", ""):
+                        plain_idx = i
+            if at_idx is not None and plain_idx is not None:
+                return at_idx < plain_idx
+        except Exception:
+            pass
+        return False
+
+    def _resolve_portrayal_target(self, event: AstrMessageEvent, cmd: str, at_target_id: str) -> str:
+        """解析画像目标ID。
+
+        新机制：
+        - 「画像 @机器人自己」→ 画像对象为机器人自己
+        - 「@机器人自己 画像」→ 画像对象为消息发送者
+        - 其他情况（@别人 / 未@机器人自己）→ 保持原逻辑，画像被@的人
+        """
+        self_id = str(event.get_self_id() or "")
+        at_target = str(at_target_id or "")
+        if not at_target or not self_id or at_target != self_id:
+            return at_target_id
+
+        if self._is_at_before_cmd(event, cmd):
+            # @在前：@机器人 画像 → 画像发送者
+            return event.get_sender_id() or at_target_id
+        # 命令在前：画像 @机器人 → 画像机器人自己
+        return self_id
 
     def _extract_nickname_from_qqofficial(self, event: AstrMessageEvent, target_id: str) -> str:
         """获取目标用户昵称。优先从消息缓存中的昵称映射取。"""
@@ -182,8 +300,15 @@ class PortrayalPlugin(Star):
         if prompt.need_admin and not event.is_admin():
             return
 
-        target_id = self._parse_at_from_qqofficial(event)
-        logger.info(f"[portrayal_debug] target_id={target_id}")
+        at_target_id = self._parse_at_from_qqofficial(event)
+        logger.info(f"[portrayal_debug] at_target_id={at_target_id}")
+        if not at_target_id:
+            yield event.plain_result("命令格式：画像 @群友 <查询轮数>")
+            return
+
+        # 新机制：@机器人自己时，根据命令词与@的前后顺序决定画像对象
+        target_id = self._resolve_portrayal_target(event, cmd, at_target_id)
+        logger.info(f"[portrayal_debug] resolved target_id={target_id}")
         if not target_id:
             yield event.plain_result("命令格式：画像 @群友 <查询轮数>")
             return
@@ -211,9 +336,16 @@ class PortrayalPlugin(Star):
         # QQ官方Bot: 从历史数据库查询消息
         group_openid, _ = self._extract_qqofficial_ids(event)
         platform_id = event.get_platform_id() or "qq_official"
-        result = await self.msg.get_user_texts(
-            platform_id, group_openid, target_id, self.cfg.message.max_msg_count
-        )
+        self_id = event.get_self_id() or ""
+        if target_id == self_id:
+            # 画像机器人自己：QQ官方Bot 不回推自己的消息，从会话历史(assistant)提取
+            result = await self.msg.get_bot_texts(
+                platform_id, group_openid, self.cfg.message.max_msg_count
+            )
+        else:
+            result = await self.msg.get_user_texts(
+                platform_id, group_openid, target_id, self.cfg.message.max_msg_count
+            )
         if result.is_empty:
             yield event.plain_result("没有查询到该群友的任何消息（QQ官方Bot依靠实时缓存，积累不够）")
             return
@@ -362,13 +494,18 @@ class PortrayalPlugin(Star):
         if prompt.need_admin and not event.is_admin():
             return
 
-        ats = [str(seg.qq) for seg in event.get_messages()[1:] if isinstance(seg, At)]
+        ats = [str(seg.qq) for seg in event.get_messages() if isinstance(seg, At)]
         if not ats:
             yield event.plain_result("命令格式：画像 @群友 <查询轮数>")
             return
 
+        # 新机制：@机器人自己时，根据命令词与@的前后顺序决定画像对象
+        target_id = self._resolve_portrayal_target(event, cmd, ats[0])
+        if not target_id:
+            yield event.plain_result("命令格式：画像 @群友 <查询轮数>")
+            return
+
         # 检查权限
-        target_id = ats[0]
         if self.cfg.message.is_protected_user(target_id):
             yield event.plain_result("该用户在保护名单中，不允许查询")
             return
